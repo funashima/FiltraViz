@@ -1,0 +1,4 @@
+PyQt6>=6.5
+pyqtgraph>=0.13
+numpy>=1.22
+gudhi>=3.8
