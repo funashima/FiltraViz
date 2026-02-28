@@ -1,5 +1,28 @@
 #!/usr/bin/env python3
+"""
+FiltraViz (H0/H1 focused) — Rips ⇄ Clique/Flag complex
+- Keep triangles (2-simplices) so H1 "death" (loop filled) is visible.
+- UI focuses on H0/H1 (no H2 plots) to avoid empty/noisy UI for 2D toy data.
+- Geometry view shows triangle fills with diff coloring:
+    BLUE   : triangles already present before the move
+    ORANGE : triangles added when ε increases
+    PURPLE : triangles removed when ε decreases
+- Barcodes: H0, H1 only (+ ε vertical indicator lines)
+- Betti curves: β0, β1 only (+ ε vertical indicator line)
+- Explain: lists events (H0 deaths, H1 births, H1 deaths) in the ε interval
+- Clique mode: k-NN parameter k is controllable in UI
+
+Fix in this version:
+- Remove pyqtgraph warning "Item already added to PlotItem, ignoring."
+  by ensuring vlines are added ONLY in rebuild() and only if vline.scene() is None.
+  on_eps_changed() only updates setValue().
+
+Dependencies:
+  pip install pyqt6 pyqtgraph gudhi numpy
+"""
+
 import sys
+import math
 import numpy as np
 
 from PyQt6 import QtWidgets, QtCore
@@ -14,37 +37,43 @@ import gudhi as gd
 # -----------------------------
 # Data generators (toy datasets)
 # -----------------------------
-def make_annulus(n=90, r=1.0, noise=0.05, seed=0):
+def make_annulus(n=100, r=1.0, noise=0.05, seed=0):
     rng = np.random.default_rng(seed)
-    theta = rng.uniform(0, 2*np.pi, n)
-    rr = r + rng.normal(0, noise, n)
-    x = rr * np.cos(theta)
-    y = rr * np.sin(theta)
+    ang = rng.uniform(0.0, 2.0 * np.pi, size=n)
+    rad = r + rng.normal(0.0, noise, size=n)
+    x = rad * np.cos(ang)
+    y = rad * np.sin(ang)
     return np.c_[x, y]
 
-def make_two_clusters(n=90, sep=2.3, noise=0.18, seed=0):
+
+def make_two_clusters(n=100, sep=2.5, noise=0.15, seed=0):
     rng = np.random.default_rng(seed)
     n1 = n // 2
     n2 = n - n1
-    c1 = np.array([-sep/2, 0.0])
-    c2 = np.array([+sep/2, 0.0])
-    X1 = c1 + rng.normal(0, noise, (n1, 2))
-    X2 = c2 + rng.normal(0, noise, (n2, 2))
-    return np.vstack([X1, X2])
+    c1 = np.array([-sep / 2.0, 0.0])
+    c2 = np.array([+sep / 2.0, 0.0])
+    x1 = c1 + rng.normal(0.0, noise, size=(n1, 2))
+    x2 = c2 + rng.normal(0.0, noise, size=(n2, 2))
+    return np.vstack([x1, x2])
 
-def make_grid_with_noise(m=10, noise=0.04, seed=0):
+
+def make_grid_with_noise(m=10, noise=0.05, seed=0):
     rng = np.random.default_rng(seed)
-    xs = np.linspace(-1, 1, m)
-    ys = np.linspace(-1, 1, m)
-    pts = np.array([(x, y) for x in xs for y in ys], dtype=float)
-    pts += rng.normal(0, noise, pts.shape)
+    xs = np.linspace(-1.0, 1.0, m)
+    ys = np.linspace(-1.0, 1.0, m)
+    pts = np.array([[x, y] for x in xs for y in ys], dtype=float)
+    pts += rng.normal(0.0, noise, size=pts.shape)
     return pts
 
 
 # -----------------------------
-# TDA core: Rips + persistence
+# Core TDA / persistence helpers
 # -----------------------------
 def compute_rips_persistence(points: np.ndarray, max_edge_length: float, max_dim: int = 2):
+    """
+    We compute up to max_dim=2 to obtain triangles (for H1 death),
+    but UI will focus on H0/H1.
+    """
     rc = gd.RipsComplex(points=points, max_edge_length=max_edge_length)
     st = rc.create_simplex_tree(max_dimension=max_dim)
     st.persistence()
@@ -67,287 +96,347 @@ def compute_rips_persistence(points: np.ndarray, max_edge_length: float, max_dim
     return intervals, edges, triangles
 
 
+def compute_knn_cost_edges(points: np.ndarray, k: int) -> list[tuple[int, int, float]]:
+    """Undirected k-NN graph with Euclidean distance as *cost*."""
+    n = int(points.shape[0])
+    if n <= 1:
+        return []
+    k = int(max(1, min(k, n - 1)))
+
+    diff = points[:, None, :] - points[None, :, :]
+    dist = np.sqrt(np.sum(diff * diff, axis=2))
+    np.fill_diagonal(dist, np.inf)
+
+    edges_set: set[tuple[int, int]] = set()
+    edges: list[tuple[int, int, float]] = []
+    for i in range(n):
+        nn = np.argpartition(dist[i], kth=k - 1)[:k]
+        for j in nn:
+            j = int(j)
+            a, b = (i, j) if i < j else (j, i)
+            if a == b:
+                continue
+            if (a, b) in edges_set:
+                continue
+            edges_set.add((a, b))
+            edges.append((a, b, float(dist[a, b])))
+    return edges
+
+
+def compute_clique_persistence_from_cost_graph(
+    n_vertices: int,
+    cost_edges: list[tuple[int, int, float]],
+    max_dim: int = 2,
+):
+    """
+    Clique(=Flag) complex from a weighted graph.
+    Edge filtration = cost.
+    Triangle filtration = max(costs of its edges).
+    """
+    n = int(n_vertices)
+    st = gd.SimplexTree()
+
+    for v in range(n):
+        st.insert([v], filtration=0.0)
+
+    edge_cost: dict[tuple[int, int], float] = {}
+    adj: list[set[int]] = [set() for _ in range(n)]
+
+    edges: list[tuple[int, int, float]] = []
+    for i, j, c in cost_edges:
+        a, b = (int(i), int(j)) if int(i) < int(j) else (int(j), int(i))
+        cc = float(c)
+        edge_cost[(a, b)] = cc
+        adj[a].add(b)
+        adj[b].add(a)
+        st.insert([a, b], filtration=cc)
+        edges.append((a, b, cc))
+
+    triangles: list[tuple[int, int, int, float]] = []
+    if max_dim >= 2:
+        for a in range(n):
+            na = adj[a]
+            for b in na:
+                if a >= b:
+                    continue
+                common = na.intersection(adj[b])
+                for c in common:
+                    if b >= c:
+                        continue
+                    cab = edge_cost[(a, b)]
+                    cac = edge_cost[(a, c)] if a < c else edge_cost[(c, a)]
+                    cbc = edge_cost[(b, c)]
+                    filt = float(max(cab, cac, cbc))
+                    st.insert([a, b, c], filtration=filt)
+                    triangles.append((a, b, c, filt))
+
+    st.make_filtration_non_decreasing()
+    st.persistence()
+
+    intervals = {}
+    for d in range(max_dim + 1):
+        inter = st.persistence_intervals_in_dimension(d)
+        intervals[d] = np.array(inter, dtype=float) if len(inter) else np.zeros((0, 2), dtype=float)
+
+    return intervals, edges, triangles
+
+
 def betti_from_intervals(intervals: np.ndarray, eps: float) -> int:
     if intervals.size == 0:
         return 0
     b = intervals[:, 0]
     d = intervals[:, 1]
-    alive = (b <= eps) & ((d == np.inf) | (eps < d))
+    alive = (b <= eps) & ((eps < d) | np.isinf(d))
     return int(np.sum(alive))
 
 
 def alive_mask(intervals: np.ndarray, eps: float) -> np.ndarray:
-    """Return boolean mask of alive intervals at eps for an array (k,2)."""
     if intervals.size == 0:
         return np.zeros((0,), dtype=bool)
     b = intervals[:, 0]
     d = intervals[:, 1]
-    return (b <= eps) & ((d == np.inf) | (eps < d))
+    return (b <= eps) & ((eps < d) | np.isinf(d))
+
+
+def compute_betti_curves(intervals0: np.ndarray, intervals1: np.ndarray, eps_grid: np.ndarray):
+    b0 = np.array([betti_from_intervals(intervals0, e) for e in eps_grid], dtype=float)
+    b1 = np.array([betti_from_intervals(intervals1, e) for e in eps_grid], dtype=float)
+    return b0, b1
 
 
 # -----------------------------
-# Barcode drawing as items (for highlighting + alive coloring)
+# Plotting helpers (pyqtgraph)
 # -----------------------------
-def plot_barcode_items(plot: pg.PlotWidget, intervals: np.ndarray, title: str):
-    """
-    Draw barcode as individual PlotDataItem's.
-    Returns items: list {birth, death, y, item, is_inf}
-    """
+def _barcode_xmax(intervals: np.ndarray, eps_max: float) -> float:
+    if intervals.size == 0:
+        return max(1.0, float(eps_max) * 1.10 + 1e-9)
+    finite_death = intervals[:, 1][~np.isinf(intervals[:, 1])]
+    mx = float(np.max(finite_death)) if finite_death.size else 0.0
+    base = max(mx, float(eps_max))
+    return base * 1.10 + 1e-9
+
+
+def plot_barcode_items(plot: pg.PlotWidget, intervals: np.ndarray, title: str, eps_max: float):
     plot.clear()
     plot.setTitle(title)
     plot.showGrid(x=True, y=True, alpha=0.2)
-    plot.setLabel("bottom", "ε (filtration)")
-    plot.setLabel("left", "interval index")
-    plot.setMouseEnabled(x=True, y=False)
 
     items = []
+    xmax = _barcode_xmax(intervals, eps_max)
+
     if intervals.size == 0:
+        plot.setYRange(0, 1)
+        plot.setXRange(0, xmax)
         return items
 
-    d = intervals[:, 1].copy()
-    if np.any(np.isfinite(d)):
-        d_cap = float(np.max(d[np.isfinite(d)]) + 0.2)
-    else:
-        d_cap = 1.0
-
-    d_sort = d.copy()
-    d_sort[np.isinf(d_sort)] = d_cap
-    order = np.lexsort((d_sort, intervals[:, 0]))
-    ints = intervals[order]
-
-    # Draw with a placeholder pen; actual style is set dynamically per eps.
-    placeholder_pen = pg.mkPen(width=2)
-    for y, (b, de) in enumerate(ints):
-        is_inf = bool(np.isinf(de))
+    for idx, (b, d) in enumerate(intervals):
+        y = idx
         x0 = float(b)
-        x1 = float(de) if np.isfinite(de) else d_cap
-        it = plot.plot([x0, x1], [y, y], pen=placeholder_pen)
-        items.append({"birth": float(b), "death": float(de), "y": int(y), "item": it, "is_inf": is_inf})
+        x1 = float(d) if not np.isinf(d) else xmax
+        item = pg.PlotDataItem([x0, x1], [y, y], pen=pg.mkPen(width=2))
+        plot.addItem(item)
+        items.append({"idx": idx, "item": item, "birth": float(b), "death": float(d)})
 
-    plot.setYRange(-1, len(ints) + 1, padding=0.02)
+    plot.setYRange(-1, len(intervals) + 1)
+    plot.setXRange(0, xmax)
     return items
 
 
-# -----------------------------
-# Persistence diagram
-# -----------------------------
 def plot_persistence_diagram(plot: pg.PlotWidget, intervals0: np.ndarray, intervals1: np.ndarray, title: str):
     plot.clear()
     plot.setTitle(title)
     plot.showGrid(x=True, y=True, alpha=0.2)
+
+    pts0 = intervals0.copy()
+    pts1 = intervals1.copy()
+    pts0 = pts0[~np.isinf(pts0[:, 1])] if pts0.size else pts0
+    pts1 = pts1[~np.isinf(pts1[:, 1])] if pts1.size else pts1
+
+    if pts0.size or pts1.size:
+        all_pts = np.vstack([p for p in (pts0, pts1) if p.size])
+        mx = float(np.max(all_pts))
+    else:
+        mx = 1.0
+
+    plot.addItem(
+        pg.PlotDataItem([0, mx], [0, mx], pen=pg.mkPen("w", width=1, style=QtCore.Qt.PenStyle.DashLine))
+    )
+
+    if pts0.size:
+        plot.addItem(pg.ScatterPlotItem(x=pts0[:, 0], y=pts0[:, 1], symbol="o", size=7))
+    if pts1.size:
+        plot.addItem(pg.ScatterPlotItem(x=pts1[:, 0], y=pts1[:, 1], symbol="x", size=9))
+
+    plot.setXRange(0, mx * 1.05 + 1e-9)
+    plot.setYRange(0, mx * 1.05 + 1e-9)
     plot.setLabel("bottom", "birth")
     plot.setLabel("left", "death")
-    plot.setMouseEnabled(x=True, y=True)
-
-    finite = []
-    for ints in (intervals0, intervals1):
-        if ints.size:
-            d = ints[:, 1]
-            finite.extend(d[np.isfinite(d)].tolist())
-
-    max_finite = max(finite) if finite else 1.0
-    diag_max = max_finite * 1.05 + 1e-9
-
-    plot.plot([0.0, diag_max], [0.0, diag_max], pen=pg.mkPen(style=QtCore.Qt.PenStyle.DashLine))
-
-    if intervals0.size:
-        b0 = intervals0[:, 0]
-        d0 = intervals0[:, 1].copy()
-        d0[np.isinf(d0)] = diag_max
-        plot.plot(b0, d0, pen=None, symbol='o', symbolSize=7)
-
-    if intervals1.size:
-        b1 = intervals1[:, 0]
-        d1 = intervals1[:, 1].copy()
-        d1[np.isinf(d1)] = diag_max
-        plot.plot(b1, d1, pen=None, symbol='x', symbolSize=8)
-
-    plot.setXRange(0.0, diag_max, padding=0.02)
-    plot.setYRange(0.0, diag_max, padding=0.02)
 
 
 # -----------------------------
-# Explanation (English)
-# -----------------------------
-def explain_transition(prev_eps, eps, prev_b0, b0, prev_b1, b1, intervals1):
-    if prev_eps is None:
-        return "Move ε to grow the complex. Watch how β0 (components) and β1 (holes) change."
-    if eps < prev_eps:
-        return "ε decreased: the complex shrinks (reverse filtration). Betti numbers may increase again."
-
-    msgs = []
-    if b0 < prev_b0:
-        msgs.append("β0 decreased: two connected components merged (typically when a new edge connects them).")
-    if b1 > prev_b1:
-        msgs.append("β1 increased: a new 1D cycle (a 'hole') was born (edges completed a loop before it got filled).")
-    if b1 < prev_b1:
-        msgs.append("β1 decreased: a cycle died (most commonly because 2-simplices filled the loop).")
-    if not msgs:
-        msgs.append("No Betti change: the complex is growing, but topology stayed the same in this ε range.")
-    return " ".join(msgs)
-
-
-# -----------------------------
-# Highlight controllers
+# Event / highlight helpers
 # -----------------------------
 class BarcodeHighlighter:
-    """
-    Flash highlighting a single interval index.
-    Important: after flash ends, it calls restore_fn() to re-apply alive/dead coloring.
-    """
-    def __init__(self, parent, restore_fn, highlight_ms=650, highlight_width=6, highlight_color=(0, 0, 0)):
+    """alive: GREEN, dead: GRAY, flash(): YELLOW thick"""
+    def __init__(self):
         self.items = []
-        self._idx = None
-        self._restore_fn = restore_fn
-        self._pen_hi = pg.mkPen(color=highlight_color, width=highlight_width)
-
-        self._timer = QtCore.QTimer(parent)
-        self._timer.setSingleShot(True)
-        self._timer.timeout.connect(self._on_timeout)
-        self._ms = int(highlight_ms)
+        self.last_flash_idx = None
 
     def set_items(self, items):
-        self.items = items or []
-        self._idx = None
+        self.items = items
+        self.last_flash_idx = None
 
-    def _on_timeout(self):
-        # restore full style based on alive/dead at current eps
-        self._idx = None
-        self._restore_fn()
+    def set_alive_dead_colors(self, alive: np.ndarray):
+        for d in self.items:
+            idx = d["idx"]
+            is_alive = (idx < len(alive)) and bool(alive[idx])
+            pen = pg.mkPen("g" if is_alive else (160, 160, 160), width=2 if is_alive else 1)
+            d["item"].setPen(pen)
+        if self.last_flash_idx is not None:
+            self.flash(self.last_flash_idx)
 
-    def flash(self, idx):
-        if not (0 <= idx < len(self.items)):
+    def flash(self, idx: int):
+        if idx < 0 or idx >= len(self.items):
             return
-        self._idx = idx
-        self.items[idx]["item"].setPen(self._pen_hi)
-        self._timer.start(self._ms)
+        self.last_flash_idx = idx
+        self.items[idx]["item"].setPen(pg.mkPen("y", width=4))
 
 
-class GeometryHighlighter:
+def collect_crossings(items, a: float, b: float, kind: str):
     """
-    Flash-highlight a single edge (as PlotDataItem) or a single triangle (as QGraphicsPolygonItem).
+    Collect all crossings between a and b (either direction).
+    kind: "birth" uses birth threshold, "death" uses finite death threshold.
+    Returns sorted list of (idx, t).
     """
-    def __init__(self, parent, plot_widget: pg.PlotWidget, highlight_ms=650):
-        self.plot = plot_widget
-        self._timer = QtCore.QTimer(parent)
-        self._timer.setSingleShot(True)
-        self._timer.timeout.connect(self.clear)
-        self._ms = int(highlight_ms)
-
-        self.edge_overlay = pg.PlotDataItem(pen=pg.mkPen(width=6))
-        self.plot.addItem(self.edge_overlay)
-
-        self.tri_overlay = None
-        self._tri_brush = pg.mkBrush(150, 150, 150, 170)
-        self._tri_pen = pg.mkPen(width=3)
-
-    def clear(self):
-        self.edge_overlay.setData([], [])
-        if self.tri_overlay is not None:
-            vb = self.plot.getPlotItem().vb
-            vb.removeItem(self.tri_overlay)
-            self.tri_overlay = None
-
-    def flash_edge(self, p0, p1):
-        self.clear()
-        self.edge_overlay.setData([p0[0], p1[0]], [p0[1], p1[1]])
-        self._timer.start(self._ms)
-
-    def flash_triangle(self, p0, p1, p2):
-        self.clear()
-        vb = self.plot.getPlotItem().vb
-        poly = QPolygonF([QPointF(float(p0[0]), float(p0[1])),
-                          QPointF(float(p1[0]), float(p1[1])),
-                          QPointF(float(p2[0]), float(p2[1]))])
-        item = QGraphicsPolygonItem(poly)
-        item.setBrush(self._tri_brush)
-        item.setPen(self._tri_pen)
-        vb.addItem(item)
-        self.tri_overlay = item
-        self._timer.start(self._ms)
-
-
-def detect_event_crossing(items, prev_eps, eps, kind="death"):
-    """
-    Detect next crossed event in (prev_eps, eps].
-    Returns (idx, threshold_value) or (None, None).
-    """
-    if prev_eps is None or eps <= prev_eps:
-        return None, None
-
-    cand = []
-    if kind == "birth":
-        for idx, rec in enumerate(items):
-            b = rec["birth"]
-            if np.isfinite(b) and (prev_eps < b <= eps + 1e-12):
-                cand.append((b, idx))
-    elif kind == "death":
-        for idx, rec in enumerate(items):
-            if rec.get("is_inf", False):
-                continue
-            d = rec["death"]
-            if np.isfinite(d) and (prev_eps < d <= eps + 1e-12):
-                cand.append((d, idx))
-    else:
-        raise ValueError("kind must be 'birth' or 'death'")
-
-    if not cand:
-        return None, None
-    cand.sort(key=lambda x: x[0])
-    thr, idx = cand[0]
-    return idx, float(thr)
-
-
-def find_nearest_edge_at(edges, target_eps, window=(0.0, np.inf)):
-    lo, hi = window
-    best = None
-    best_gap = np.inf
-    for i, j, f in edges:
-        if not (lo < f <= hi + 1e-12):
+    if a == b:
+        return []
+    lo, hi = (a, b) if a < b else (b, a)
+    out = []
+    for d in items:
+        t = d["birth"] if kind == "birth" else d["death"]
+        if kind == "death" and np.isinf(t):
             continue
-        gap = abs(f - target_eps)
-        if gap < best_gap:
-            best_gap = gap
+        if lo < t <= hi:
+            out.append((d["idx"], float(t)))
+    out.sort(key=lambda x: x[1])
+    return out
+
+
+def find_nearest_edge_at(edges, t: float):
+    if not edges:
+        return None
+    best = None
+    best_dt = 1e18
+    for i, j, f in edges:
+        dt = abs(f - t)
+        if dt < best_dt:
+            best_dt = dt
             best = (i, j, f)
     return best
 
 
-def find_nearest_triangle_at(triangles, target_eps, window=(0.0, np.inf)):
-    lo, hi = window
-    best = None
-    best_gap = np.inf
-    for i, j, k, f in triangles:
-        if not (lo < f <= hi + 1e-12):
-            continue
-        gap = abs(f - target_eps)
-        if gap < best_gap:
-            best_gap = gap
-            best = (i, j, k, f)
-    return best
+# -----------------------------
+# Geometry drawing (ViewBox coords)
+# -----------------------------
+class GeometryLayer:
+    """
+    Base geometry drawn in ViewBox (data coordinates).
+    Triangle diff coloring:
+      - BLUE   : f <= min(prev_eps, eps)
+      - ORANGE : prev_eps < f <= eps (when eps increases)
+      - PURPLE : eps < f <= prev_eps (when eps decreases)
+    """
+    def __init__(self, plot: pg.PlotWidget):
+        self.vb = plot.getViewBox()
+        self.edge_items = []
+        self.tri_old_items = []
+        self.tri_new_items = []
+        self.tri_removed_items = []
+
+    def clear(self):
+        for arr in (self.edge_items, self.tri_old_items, self.tri_new_items, self.tri_removed_items):
+            for it in arr:
+                try:
+                    self.vb.removeItem(it)
+                except Exception:
+                    pass
+            arr.clear()
+
+    def _add_triangle(self, p0, p1, p2, fill_rgba, target_list):
+        poly = QPolygonF([QPointF(p0[0], p0[1]), QPointF(p1[0], p1[1]), QPointF(p2[0], p2[1])])
+        gi = QGraphicsPolygonItem(poly)
+        gi.setBrush(pg.mkBrush(*fill_rgba))
+        gi.setPen(pg.mkPen(None))
+        self.vb.addItem(gi)
+        target_list.append(gi)
+
+    def draw(self, points, edges, triangles, eps: float, prev_eps: float):
+        self.clear()
+
+        edge_pen = pg.mkPen(180, 180, 180, width=1)
+        for i, j, f in edges:
+            if f <= eps:
+                p0 = points[i]
+                p1 = points[j]
+                item = pg.PlotDataItem([p0[0], p1[0]], [p0[1], p1[1]], pen=edge_pen)
+                self.vb.addItem(item)
+                self.edge_items.append(item)
+
+        eps_lo = min(eps, prev_eps)
+        for i, j, k, f in triangles:
+            if f <= eps_lo:
+                self._add_triangle(points[i], points[j], points[k], (80, 160, 255, 60), self.tri_old_items)
+            elif eps < prev_eps and (eps < f <= prev_eps):
+                self._add_triangle(points[i], points[j], points[k], (180, 80, 255, 70), self.tri_removed_items)
+            elif eps >= prev_eps and (prev_eps < f <= eps):
+                self._add_triangle(points[i], points[j], points[k], (255, 165, 0, 90), self.tri_new_items)
 
 
-# -----------------------------
-# Betti curves
-# -----------------------------
-def compute_betti_curve(intervals: np.ndarray, eps_grid: np.ndarray) -> np.ndarray:
-    if intervals.size == 0:
-        return np.zeros_like(eps_grid, dtype=int)
-    b = intervals[:, 0]
-    d = intervals[:, 1]
-    out = np.empty_like(eps_grid, dtype=int)
-    for t, eps in enumerate(eps_grid):
-        alive = (b <= eps) & ((d == np.inf) | (eps < d))
-        out[t] = int(np.sum(alive))
-    return out
+class GeometryOverlay:
+    """Overlay highlight in ViewBox (edge or triangle outlines)"""
+    def __init__(self, plot: pg.PlotWidget):
+        self.vb = plot.getViewBox()
+        self.edge_item = None
+        self.tri_outline_items = []
+
+    def clear(self):
+        if self.edge_item is not None:
+            try:
+                self.vb.removeItem(self.edge_item)
+            except Exception:
+                pass
+            self.edge_item = None
+        for it in self.tri_outline_items:
+            try:
+                self.vb.removeItem(it)
+            except Exception:
+                pass
+        self.tri_outline_items = []
+
+    def highlight_edge(self, p0, p1, color="r", width=6):
+        self.clear()
+        self.edge_item = pg.PlotDataItem([p0[0], p1[0]], [p0[1], p1[1]], pen=pg.mkPen(color, width=width))
+        self.vb.addItem(self.edge_item)
+
+    def highlight_triangles_outline(self, tris_pts, color="orange", width=5):
+        self.clear()
+        for (p0, p1, p2) in tris_pts:
+            item = pg.PlotDataItem(
+                [p0[0], p1[0], p2[0], p0[0]],
+                [p0[1], p1[1], p2[1], p0[1]],
+                pen=pg.mkPen(color, width=width),
+            )
+            self.vb.addItem(item)
+            self.tri_outline_items.append(item)
 
 
 # -----------------------------
 # Main GUI
 # -----------------------------
-class TDAToy(QtWidgets.QMainWindow):
+class FiltraViz(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("TDA Toy Tool: Filtration ↔ (H0,H1) Barcodes/Diagram/Betti (Rips, 2D)")
+        self.setWindowTitle("FiltraViz: H0/H1 (Rips ⇄ Clique) + Triangle Fill Events")
 
         cw = QtWidgets.QWidget()
         self.setCentralWidget(cw)
@@ -365,39 +454,55 @@ class TDAToy(QtWidgets.QMainWindow):
         self.geom = pg.PlotWidget()
         self.geom.setAspectLocked(True)
         self.geom.showGrid(x=True, y=True, alpha=0.2)
-        self.geom.setTitle("Point cloud + Rips complex at ε")
+        self.geom.setTitle("Geometry: OLD(blue), NEW(orange), REMOVED(purple)")
         left_layout.addWidget(self.geom, stretch=1)
+
+        self.scatter = pg.ScatterPlotItem(size=8, brush=pg.mkBrush(230, 230, 230))
+        self.geom.getViewBox().addItem(self.scatter)
+
+        self.base_layer = GeometryLayer(self.geom)
+        self.overlay = GeometryOverlay(self.geom)
 
         # Right: tabs
         right = QtWidgets.QTabWidget()
-        upper_layout.addWidget(right, stretch=2)
+        upper_layout.addWidget(right, stretch=3)
 
-        # Tab: barcodes
-        barcode_tab = QtWidgets.QWidget()
-        barcode_layout = QtWidgets.QVBoxLayout(barcode_tab)
+        # Barcodes tab (H0/H1 only)
+        tab_bar = QtWidgets.QWidget()
+        tab_bar_layout = QtWidgets.QVBoxLayout(tab_bar)
+        right.addTab(tab_bar, "Barcodes")
         self.bar0 = pg.PlotWidget()
         self.bar1 = pg.PlotWidget()
-        barcode_layout.addWidget(self.bar0, stretch=1)
-        barcode_layout.addWidget(self.bar1, stretch=1)
-        right.addTab(barcode_tab, "Barcodes")
+        tab_bar_layout.addWidget(self.bar0, stretch=1)
+        tab_bar_layout.addWidget(self.bar1, stretch=1)
 
-        # Tab: persistence diagram
-        diag_tab = QtWidgets.QWidget()
-        diag_layout = QtWidgets.QVBoxLayout(diag_tab)
+        # Diagram tab
+        tab_diag = QtWidgets.QWidget()
+        tab_diag_layout = QtWidgets.QVBoxLayout(tab_diag)
+        right.addTab(tab_diag, "Diagram")
         self.pdiag = pg.PlotWidget()
-        diag_layout.addWidget(self.pdiag, stretch=1)
-        right.addTab(diag_tab, "Persistence diagram")
+        tab_diag_layout.addWidget(self.pdiag, stretch=1)
 
-        # Tab: Betti curves (NEW)
-        betti_tab = QtWidgets.QWidget()
-        betti_layout = QtWidgets.QVBoxLayout(betti_tab)
-        self.betti0_plot = pg.PlotWidget()
-        self.betti1_plot = pg.PlotWidget()
-        betti_layout.addWidget(self.betti0_plot, stretch=1)
-        betti_layout.addWidget(self.betti1_plot, stretch=1)
-        right.addTab(betti_tab, "Betti curves")
+        # Betti tab (β0/β1 only)
+        tab_betti = QtWidgets.QWidget()
+        tab_betti_layout = QtWidgets.QVBoxLayout(tab_betti)
+        right.addTab(tab_betti, "Betti")
+        self.betti_plot = pg.PlotWidget()
+        self.betti_plot.showGrid(x=True, y=True, alpha=0.2)
+        tab_betti_layout.addWidget(self.betti_plot, stretch=1)
 
-        # Controls row
+        # Explain tab
+        tab_explain = QtWidgets.QWidget()
+        tab_explain_layout = QtWidgets.QVBoxLayout(tab_explain)
+        right.addTab(tab_explain, "Explain")
+        self.explain_chk = QtWidgets.QCheckBox("Explanation mode (list all events in the ε-interval)")
+        self.explain_chk.setChecked(True)
+        tab_explain_layout.addWidget(self.explain_chk)
+        self.explain_text = QtWidgets.QTextEdit()
+        self.explain_text.setReadOnly(True)
+        tab_explain_layout.addWidget(self.explain_text, stretch=1)
+
+        # Controls
         controls = QtWidgets.QWidget()
         c = QtWidgets.QHBoxLayout(controls)
         root.addWidget(controls, stretch=0)
@@ -406,6 +511,25 @@ class TDAToy(QtWidgets.QMainWindow):
         self.dataset.addItems(["Annulus (1 hole)", "Two clusters (H0 merges)", "Grid+noise (many small holes)"])
         c.addWidget(QtWidgets.QLabel("Dataset:"))
         c.addWidget(self.dataset)
+
+        self.complex_mode = QtWidgets.QComboBox()
+        self.complex_mode.addItems(["Rips (distance threshold)", "Clique (k-NN cost graph)"])
+        self.complex_mode.setCurrentIndex(1)  # default = Clique
+        c.addWidget(QtWidgets.QLabel("Complex:"))
+        c.addWidget(self.complex_mode)
+
+        self.n_nodes = QtWidgets.QSpinBox()
+        self.n_nodes.setRange(10, 2000)
+        self.n_nodes.setSingleStep(10)
+        self.n_nodes.setValue(100)
+        c.addWidget(QtWidgets.QLabel("N:"))
+        c.addWidget(self.n_nodes)
+
+        self.k_knn = QtWidgets.QSpinBox()
+        self.k_knn.setRange(1, 200)
+        self.k_knn.setValue(10)
+        c.addWidget(QtWidgets.QLabel("k (Clique):"))
+        c.addWidget(self.k_knn)
 
         self.seed = QtWidgets.QSpinBox()
         self.seed.setRange(0, 9999)
@@ -423,295 +547,250 @@ class TDAToy(QtWidgets.QMainWindow):
         c.addWidget(QtWidgets.QLabel("ε:"))
         c.addWidget(self.eps_slider, stretch=1)
 
-        self.eps_label = QtWidgets.QLabel("ε = 0.0")
+        self.eps_label = QtWidgets.QLabel("ε = 0.000")
         c.addWidget(self.eps_label)
 
-        self.betti_label = QtWidgets.QLabel("β0=?, β1=?")
+        self.betti_label = QtWidgets.QLabel("β0=0, β1=0")
         c.addWidget(self.betti_label)
 
-        self.explain_toggle = QtWidgets.QCheckBox("Explanation mode")
-        self.explain_toggle.setChecked(True)
-        c.addWidget(self.explain_toggle)
+        # ε indicator lines (add only in rebuild(); always visible by Z)
+        self.vline0 = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("w", width=2))
+        self.vline1 = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("w", width=2))
+        self.vline_betti = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("w", width=2))
+        for ln in (self.vline0, self.vline1, self.vline_betti):
+            ln.setZValue(10_000)
 
-        self.explain = QtWidgets.QTextEdit()
-        self.explain.setReadOnly(True)
-        self.explain.setMinimumHeight(70)
-        root.addWidget(self.explain, stretch=0)
-
-        # State
-        self.points = None
+        # persistence data (H0/H1 + geometry)
+        self.points = np.zeros((0, 2), dtype=float)
         self.edges = []
         self.triangles = []
-        self.intervals = {0: np.zeros((0, 2)), 1: np.zeros((0, 2))}
-        self.eps_max = 1.0
+        self.intervals0 = np.zeros((0, 2), dtype=float)
+        self.intervals1 = np.zeros((0, 2), dtype=float)
 
-        self.prev_eps = None
-        self.prev_b0 = None
-        self.prev_b1 = None
-
-        # Geometry items
-        self.scatter = pg.ScatterPlotItem(size=7)
-        self.geom.addItem(self.scatter)
-        self.edge_item = pg.PlotDataItem(pen=pg.mkPen(width=1))
-        self.geom.addItem(self.edge_item)
-
-        # Filled triangles
-        self.tri_items = []
-        self.tri_brush = pg.mkBrush(150, 150, 150, 80)
-        self.tri_pen = pg.mkPen(width=1)
-
-        # Geometry overlay highlighter
-        self.geom_hi = GeometryHighlighter(self, self.geom, highlight_ms=650)
-
-        # Barcode vlines
-        self.vline0 = pg.InfiniteLine(angle=90, movable=False)
-        self.vline1 = pg.InfiniteLine(angle=90, movable=False)
-
-        # Betti vlines (NEW)
-        self.vline_b0 = pg.InfiniteLine(angle=90, movable=False)
-        self.vline_b1 = pg.InfiniteLine(angle=90, movable=False)
-        self.betti0_plot.addItem(self.vline_b0)
-        self.betti1_plot.addItem(self.vline_b1)
-
-        # Barcode items
         self.bar0_items = []
         self.bar1_items = []
+        self.hi0 = BarcodeHighlighter()
+        self.hi1 = BarcodeHighlighter()
 
-        # Pens for alive/dead bars (NEW)
-        self.pen_alive0 = pg.mkPen(color=(40, 90, 200), width=3)  # H0 alive
-        self.pen_dead0  = pg.mkPen(color=(180, 180, 180), width=2)
-        self.pen_alive1 = pg.mkPen(color=(200, 90, 40), width=3)  # H1 alive
-        self.pen_dead1  = pg.mkPen(color=(180, 180, 180), width=2)
+        self.prev_eps = 0.0
+        self.prev_b0 = 0
+        self.prev_b1 = 0
 
-        # Highlighters (restore_fn re-applies alive/dead coloring)
-        self.hi0 = BarcodeHighlighter(self, restore_fn=self.update_alive_bar_styles, highlight_ms=650,
-                                      highlight_width=6, highlight_color=(0, 0, 0))
-        self.hi1 = BarcodeHighlighter(self, restore_fn=self.update_alive_bar_styles, highlight_ms=650,
-                                      highlight_width=6, highlight_color=(0, 0, 0))
-
-        # Betti curves cached (NEW)
-        self.betti_eps_grid = None
-        self.betti0_vals = None
-        self.betti1_vals = None
-        self.betti0_curve_item = None
-        self.betti1_curve_item = None
-
-        # Signals
+        # events
         self.rebuild_btn.clicked.connect(self.rebuild)
-        self.dataset.currentIndexChanged.connect(self.rebuild)
-        self.seed.valueChanged.connect(self.rebuild)
+        self.dataset.currentIndexChanged.connect(lambda _=None: self.rebuild())
+        self.seed.valueChanged.connect(lambda _=None: self.rebuild())
+        self.complex_mode.currentIndexChanged.connect(lambda _=None: self.rebuild())
+        self.n_nodes.valueChanged.connect(lambda _=None: self.rebuild())
+        self.k_knn.valueChanged.connect(lambda _=None: self.rebuild())
         self.eps_slider.valueChanged.connect(self.on_eps_changed)
 
         self.rebuild()
 
     def slider_to_eps(self, v: int) -> float:
-        return (v / 1000.0) * self.eps_max
+        return float(v) / 1000.0 * float(self.eps_max)
 
-    # -------------------------
-    # Geometry rendering
-    # -------------------------
-    def clear_triangle_items(self):
-        vb = self.geom.getPlotItem().vb
-        for it in self.tri_items:
-            vb.removeItem(it)
-        self.tri_items.clear()
-
-    def update_complex_view(self, eps: float):
-        pts = self.points
-
-        xs, ys = [], []
-        for i, j, f in self.edges:
-            if f <= eps + 1e-12:
-                xs.extend([pts[i, 0], pts[j, 0], np.nan])
-                ys.extend([pts[i, 1], pts[j, 1], np.nan])
-        self.edge_item.setData(np.array(xs), np.array(ys)) if xs else self.edge_item.setData([], [])
-
-        self.clear_triangle_items()
-        vb = self.geom.getPlotItem().vb
-        for i, j, k, f in self.triangles:
-            if f <= eps + 1e-12:
-                poly = QPolygonF([
-                    QPointF(float(pts[i, 0]), float(pts[i, 1])),
-                    QPointF(float(pts[j, 0]), float(pts[j, 1])),
-                    QPointF(float(pts[k, 0]), float(pts[k, 1])),
-                ])
-                item = QGraphicsPolygonItem(poly)
-                item.setBrush(self.tri_brush)
-                item.setPen(self.tri_pen)
-                vb.addItem(item)
-                self.tri_items.append(item)
-
-    # -------------------------
-    # Alive/dead styling (NEW)
-    # -------------------------
-    def update_alive_bar_styles(self):
+    def _add_vline_once(self, plot: pg.PlotWidget, vline: pg.InfiniteLine):
         """
-        Apply alive/dead pens to all H0/H1 barcode items at current eps.
-        Called on eps change and after flash highlight ends.
+        Add vline only if it is not in any scene yet.
+        This avoids duplicate-add warnings reliably.
         """
-        eps = self.slider_to_eps(int(self.eps_slider.value()))
+        if vline.scene() is not None:
+            return
+        plot.addItem(vline)
 
-        # H0
-        for rec in self.bar0_items:
-            b, d = rec["birth"], rec["death"]
-            alive = (b <= eps) and ((d == np.inf) or (eps < d))
-            rec["item"].setPen(self.pen_alive0 if alive else self.pen_dead0)
-
-        # H1
-        for rec in self.bar1_items:
-            b, d = rec["birth"], rec["death"]
-            alive = (b <= eps) and ((d == np.inf) or (eps < d))
-            rec["item"].setPen(self.pen_alive1 if alive else self.pen_dead1)
-
-    # -------------------------
-    # Betti curves tab (NEW)
-    # -------------------------
-    def build_betti_curves(self):
-        # sample eps grid
-        n = 300
-        self.betti_eps_grid = np.linspace(0.0, self.eps_max, n)
-        self.betti0_vals = compute_betti_curve(self.intervals[0], self.betti_eps_grid)
-        self.betti1_vals = compute_betti_curve(self.intervals[1], self.betti_eps_grid)
-
-        # plot
-        for pl, title in [(self.betti0_plot, "β0(ε)"), (self.betti1_plot, "β1(ε)")]:
-            pl.clear()
-            pl.showGrid(x=True, y=True, alpha=0.2)
-            pl.setLabel("bottom", "ε (filtration)")
-            pl.setLabel("left", "Betti")
-            pl.setTitle(title)
-            pl.setMouseEnabled(x=True, y=True)
-
-        self.betti0_curve_item = self.betti0_plot.plot(self.betti_eps_grid, self.betti0_vals, pen=pg.mkPen(width=2))
-        self.betti1_curve_item = self.betti1_plot.plot(self.betti_eps_grid, self.betti1_vals, pen=pg.mkPen(width=2))
-
-        # re-add vlines
-        self.betti0_plot.addItem(self.vline_b0)
-        self.betti1_plot.addItem(self.vline_b1)
-
-    # -------------------------
-    # Rebuild
-    # -------------------------
     def rebuild(self):
         idx = self.dataset.currentIndex()
         seed = int(self.seed.value())
+        n = int(self.n_nodes.value())
+        mode = self.complex_mode.currentIndex()
 
+        self.k_knn.setEnabled(mode == 1)
+
+        # generate points
         if idx == 0:
-            pts = make_annulus(n=90, r=1.0, noise=0.05, seed=seed)
+            pts = make_annulus(n=n, r=1.0, noise=0.05, seed=seed)
             suggested_max = 1.2
         elif idx == 1:
-            pts = make_two_clusters(n=90, sep=2.3, noise=0.18, seed=seed)
+            pts = make_two_clusters(n=n, sep=2.3, noise=0.18, seed=seed)
             suggested_max = 2.0
         else:
-            pts = make_grid_with_noise(m=10, noise=0.04, seed=seed)
+            mgrid = max(3, int(round(math.sqrt(n))))
+            pts = make_grid_with_noise(m=mgrid, noise=0.04, seed=seed)
+            if pts.shape[0] > n:
+                rng = np.random.default_rng(seed)
+                sel = rng.choice(pts.shape[0], size=n, replace=False)
+                pts = pts[sel]
             suggested_max = 0.8
 
         self.points = pts
-        self.eps_max = float(suggested_max)
 
-        intervals, edges, triangles = compute_rips_persistence(
-            points=self.points,
-            max_edge_length=self.eps_max,
-            max_dim=2
-        )
-        self.intervals[0] = intervals.get(0, np.zeros((0, 2)))
-        self.intervals[1] = intervals.get(1, np.zeros((0, 2)))
+        # compute persistence up to dim=2 (triangles), but we only use H0/H1 for UI
+        if mode == 0:
+            self.eps_max = float(suggested_max)
+            intervals, edges, triangles = compute_rips_persistence(
+                points=self.points,
+                max_edge_length=self.eps_max,
+                max_dim=2,
+            )
+        else:
+            k = int(self.k_knn.value())
+            k = min(k, max(1, n - 1))
+            cost_edges = compute_knn_cost_edges(self.points, k=k)
+            self.eps_max = float(max([c for _, _, c in cost_edges], default=suggested_max))
+            intervals, edges, triangles = compute_clique_persistence_from_cost_graph(
+                n_vertices=self.points.shape[0],
+                cost_edges=cost_edges,
+                max_dim=2,
+            )
+
         self.edges = edges
         self.triangles = triangles
+        self.intervals0 = intervals.get(0, np.zeros((0, 2), dtype=float))
+        self.intervals1 = intervals.get(1, np.zeros((0, 2), dtype=float))
 
+        # scatter
         self.scatter.setData(self.points[:, 0], self.points[:, 1])
 
-        # Barcodes
-        self.bar0_items = plot_barcode_items(self.bar0, self.intervals[0], "H0 barcode")
-        self.bar1_items = plot_barcode_items(self.bar1, self.intervals[1], "H1 barcode")
-        self.bar0.addItem(self.vline0)
-        self.bar1.addItem(self.vline1)
+        # barcodes (H0/H1)
+        self.bar0_items = plot_barcode_items(self.bar0, self.intervals0, "H0 barcode", eps_max=self.eps_max)
+        self.bar1_items = plot_barcode_items(self.bar1, self.intervals1, "H1 barcode", eps_max=self.eps_max)
+
+        # add vlines exactly once per scene; safe after plot.clear()
+        self._add_vline_once(self.bar0, self.vline0)
+        self._add_vline_once(self.bar1, self.vline1)
 
         self.hi0.set_items(self.bar0_items)
         self.hi1.set_items(self.bar1_items)
 
-        # Diagram
-        plot_persistence_diagram(self.pdiag, self.intervals[0], self.intervals[1], "Persistence diagram (H0: o, H1: x)")
+        # diagram (H0/H1)
+        plot_persistence_diagram(self.pdiag, self.intervals0, self.intervals1, "Persistence diagram (H0: o, H1: x)")
 
-        # Betti curves
-        self.build_betti_curves()
+        # betti curves (β0/β1)
+        self.betti_plot.clear()
+        self.betti_plot.showGrid(x=True, y=True, alpha=0.2)
+        self.betti_plot.setTitle("Betti curves β0, β1 vs ε")
+        eps_grid = np.linspace(0.0, float(self.eps_max), 250)
+        b0, b1 = compute_betti_curves(self.intervals0, self.intervals1, eps_grid)
+        self.betti_plot.addItem(pg.PlotDataItem(eps_grid, b0, pen=pg.mkPen("c", width=2)))
+        self.betti_plot.addItem(pg.PlotDataItem(eps_grid, b1, pen=pg.mkPen("m", width=2)))
 
-        # Reset prev state
-        self.prev_eps = None
-        self.prev_b0 = None
-        self.prev_b1 = None
-        self.geom_hi.clear()
+        self._add_vline_once(self.betti_plot, self.vline_betti)
 
+        # reset prev
+        self.prev_eps = 0.0
+        self.prev_b0 = betti_from_intervals(self.intervals0, self.prev_eps)
+        self.prev_b1 = betti_from_intervals(self.intervals1, self.prev_eps)
+
+        self.overlay.clear()
+        self.base_layer.clear()
+
+        # render
         self.on_eps_changed(self.eps_slider.value())
-        self.geom.autoRange()
 
-    # -------------------------
-    # Main update on eps change
-    # -------------------------
     def on_eps_changed(self, v: int):
-        eps = self.slider_to_eps(int(v))
+        eps = self.slider_to_eps(v)
         self.eps_label.setText(f"ε = {eps:.3f}")
 
-        # vlines
-        self.vline0.setPos(eps)
-        self.vline1.setPos(eps)
-        self.vline_b0.setPos(eps)
-        self.vline_b1.setPos(eps)
+        # update ε lines (do NOT addItem here; prevents warning)
+        self.vline0.setValue(eps)
+        self.vline1.setValue(eps)
+        self.vline_betti.setValue(eps)
 
-        # Betti numbers
-        b0 = betti_from_intervals(self.intervals[0], eps)
-        b1 = betti_from_intervals(self.intervals[1], eps)
+        # betti numbers
+        b0 = betti_from_intervals(self.intervals0, eps)
+        b1 = betti_from_intervals(self.intervals1, eps)
         self.betti_label.setText(f"β0={b0}, β1={b1}")
 
-        # Update alive/dead bar coloring (NEW)
-        self.update_alive_bar_styles()
+        # geometry draw (diff triangles)
+        self.base_layer.draw(self.points, self.edges, self.triangles, eps=eps, prev_eps=self.prev_eps)
 
-        # Event-driven flash + geometry highlight (forward only)
-        if self.prev_eps is not None and eps > self.prev_eps:
-            window = (self.prev_eps, eps)
+        # barcode coloring
+        self.hi0.set_alive_dead_colors(alive_mask(self.intervals0, eps))
+        self.hi1.set_alive_dead_colors(alive_mask(self.intervals1, eps))
 
-            # H0: DEATH when components merge
-            if self.prev_b0 is not None and b0 < self.prev_b0:
-                idx0, t0 = detect_event_crossing(self.bar0_items, self.prev_eps, eps, kind="death")
-                if idx0 is not None:
-                    self.hi0.flash(idx0)
-                    e = find_nearest_edge_at(self.edges, t0, window=window)
-                    if e is not None:
-                        i, j, _ = e
-                        self.geom_hi.flash_edge(self.points[i], self.points[j])
+        # events in the interval (supports big slider jumps)
+        h0_deaths = collect_crossings(self.bar0_items, self.prev_eps, eps, kind="death")
+        h1_births = collect_crossings(self.bar1_items, self.prev_eps, eps, kind="birth")
+        h1_deaths = collect_crossings(self.bar1_items, self.prev_eps, eps, kind="death")
 
-            # H1: BIRTH when a hole is born
-            if self.prev_b1 is not None and b1 > self.prev_b1:
-                idx1b, t1b = detect_event_crossing(self.bar1_items, self.prev_eps, eps, kind="birth")
-                if idx1b is not None:
-                    self.hi1.flash(idx1b)
-                    e = find_nearest_edge_at(self.edges, t1b, window=window)
-                    if e is not None:
-                        i, j, _ = e
-                        self.geom_hi.flash_edge(self.points[i], self.points[j])
+        # representative highlight (latest forward / earliest backward)
+        self.overlay.clear()
+        rep = None  # ("type", idx, t)
+        if eps > self.prev_eps:
+            candidates = []
+            candidates += [("H0 death", idx, t) for (idx, t) in h0_deaths]
+            candidates += [("H1 birth", idx, t) for (idx, t) in h1_births]
+            candidates += [("H1 death", idx, t) for (idx, t) in h1_deaths]
+            if candidates:
+                rep = max(candidates, key=lambda x: x[2])
+        elif eps < self.prev_eps:
+            candidates = []
+            candidates += [("H0 death", idx, t) for (idx, t) in h0_deaths]
+            candidates += [("H1 birth", idx, t) for (idx, t) in h1_births]
+            candidates += [("H1 death", idx, t) for (idx, t) in h1_deaths]
+            if candidates:
+                rep = min(candidates, key=lambda x: x[2])
 
-            # H1: DEATH when a hole dies
-            if self.prev_b1 is not None and b1 < self.prev_b1:
-                idx1d, t1d = detect_event_crossing(self.bar1_items, self.prev_eps, eps, kind="death")
-                if idx1d is not None:
-                    self.hi1.flash(idx1d)
-                    tri = find_nearest_triangle_at(self.triangles, t1d, window=window)
-                    if tri is not None:
-                        i, j, k, _ = tri
-                        self.geom_hi.flash_triangle(self.points[i], self.points[j], self.points[k])
+        if rep is not None:
+            ev_type, idx_rep, t_rep = rep
+            if ev_type == "H0 death":
+                self.hi0.flash(idx_rep)
+                e = find_nearest_edge_at(self.edges, t_rep)
+                if e is not None:
+                    i, j, _ = e
+                    self.overlay.highlight_edge(self.points[i], self.points[j], color="r", width=6)
 
-        # Explanation
-        if self.explain_toggle.isChecked():
-            self.explain.setPlainText(
-                explain_transition(self.prev_eps, eps, self.prev_b0, b0, self.prev_b1, b1, self.intervals[1])
-            )
-        else:
-            self.explain.setPlainText("")
+            elif ev_type == "H1 birth":
+                self.hi1.flash(idx_rep)
+                e = find_nearest_edge_at(self.edges, t_rep)
+                if e is not None:
+                    i, j, _ = e
+                    self.overlay.highlight_edge(self.points[i], self.points[j], color="g", width=6)
 
-        # Geometry at eps
-        self.update_complex_view(eps)
+            elif ev_type == "H1 death":
+                self.hi1.flash(idx_rep)
+                # Outline triangles close to death time within the changed set
+                if eps >= self.prev_eps:
+                    changed_tris = [(i, j, k, f) for (i, j, k, f) in self.triangles if (self.prev_eps < f <= eps)]
+                else:
+                    changed_tris = [(i, j, k, f) for (i, j, k, f) in self.triangles if (eps < f <= self.prev_eps)]
+                if changed_tris:
+                    changed_tris.sort(key=lambda x: abs(x[3] - t_rep))
+                    top = changed_tris[: min(8, len(changed_tris))]
+                    tris_pts = [(self.points[i], self.points[j], self.points[k]) for (i, j, k, _) in top]
+                    self.overlay.highlight_triangles_outline(tris_pts, color="orange", width=5)
 
-        # Store prev
+        if self.explain_chk.isChecked():
+            lines = []
+            lines.append(f"Mode: {self.complex_mode.currentText()}")
+            if self.complex_mode.currentIndex() == 1:
+                lines.append(f"Clique k: {int(self.k_knn.value())}")
+            lines.append(f"ε moved: {self.prev_eps:.4f} → {eps:.4f}")
+            lines.append(f"β0,β1: ({self.prev_b0},{self.prev_b1}) → ({b0},{b1})")
+            lines.append("")
+
+            def fmt_list(name, xs):
+                if not xs:
+                    return [f"{name}: (none)"]
+                s = [f"{name}:"]
+                for (idx, t) in xs[:30]:
+                    s.append(f"  - idx={idx}, t={t:.6f}")
+                if len(xs) > 30:
+                    s.append(f"  ... ({len(xs)-30} more)")
+                return s
+
+            lines += fmt_list("H0 deaths (component merges)", h0_deaths)
+            lines += fmt_list("H1 births (loop appears)", h1_births)
+            lines += fmt_list("H1 deaths (loop filled by triangles)", h1_deaths)
+            lines.append("")
+            lines.append("Geometry diff coloring:")
+            lines.append("  - BLUE  : triangles with f ≤ min(prev_eps, eps)")
+            lines.append("  - ORANGE: triangles added in this move (ε increased)")
+            lines.append("  - PURPLE: triangles removed in this move (ε decreased)")
+            self.explain_text.setPlainText("\n".join(lines))
+
+        # update prev
         self.prev_eps = eps
         self.prev_b0 = b0
         self.prev_b1 = b1
@@ -719,10 +798,12 @@ class TDAToy(QtWidgets.QMainWindow):
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
-    w = TDAToy()
-    w.resize(1450, 860)
+    pg.setConfigOptions(antialias=True, background=(20, 20, 20), foreground=(230, 230, 230))
+    w = FiltraViz()
+    w.resize(1500, 820)
     w.show()
     sys.exit(app.exec())
+
 
 if __name__ == "__main__":
     main()
